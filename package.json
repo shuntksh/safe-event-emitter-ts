@@ -32,9 +32,9 @@
 	},
 	"devDependencies": {
 		"@biomejs/biome": "1.9.4",
-		"@types/bun": "1.2.4",
-		"fast-check": "3.23.2",
-		"fast-check-bun-test": "0.1.0",
+		"@types/bun": "1.2.5",
+		"fast-check": "4.0.0",
+		"fast-check-bun-test": "0.1.1",
 		"mitata": "^1.0.34",
 		"tsup": "8.4.0"
 	},
