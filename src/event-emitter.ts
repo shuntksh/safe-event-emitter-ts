@@ -1,567 +1,645 @@
-import type {
-	EmitterSettings,
-	EventHandler,
-	EventMap,
-	EventName,
-	EventNames,
-	HandlerOptions,
-	HandlerReference,
-	EventEmitter as IEventEmitter,
-	InternalEvents,
-	WildcardHandler,
-} from "./types";
+/**
+ * TypedEventEmitter - A high-performance, end-to-end type-safe event emitter.
+ *
+ * Designed for both browser and Node.js/Bun environments with zero dependencies.
+ * Implements critical micro-optimizations from eventemitter3 while providing
+ * strict TypeScript type safety for custom event definitions.
+ *
+ * Key features:
+ * - End-to-end type safety: event names, payloads, and listeners are all type-checked
+ * - Zero external dependencies
+ * - Single listener optimization (no array allocation for single listener)
+ * - Direct call optimization for 0-5 arguments (avoids Function.prototype.apply)
+ * - Built-in context support (no .bind() needed)
+ * - Null-prototype events object (no prototype chain lookups)
+ * - Cross-platform (Browser, Node.js, Bun)
+ *
+ * @example
+ * ```typescript
+ * type MyEvents = {
+ *   'data': [value: number, label: string];
+ *   'error': [error: Error];
+ *   'complete': [];
+ * };
+ *
+ * const emitter = new TypedEventEmitter<MyEvents>();
+ *
+ * // Fully typed listeners - value inferred as number and label as string
+ * emitter.on('data', (value, label) => {
+ *   console.log(value.toFixed(2), label.toUpperCase());
+ * });
+ *
+ * // Type-checked emit
+ * emitter.emit('data', 42, 'test'); // OK
+ * emitter.emit('data', 'wrong');    // Type error!
+ * emitter.emit('unknown', 1);       // Type error!
+ * ```
+ *
+ * @module
+ */
 
 /**
- * A type-safe event emitter implementation with support for wildcards, async handlers,
- * and memory leak detection.
+ * Event map type - maps event names to their argument tuples.
+ * Use labeled tuple elements for better IDE experience.
+ *
+ * @example
+ * ```typescript
+ * type Events = {
+ *   'pointer:move': [x: number, y: number, pressure: number];
+ *   'frame:begin': [];
+ *   'error': [error: Error];
+ * };
+ * ```
  */
-export class EventEmitter<Events extends EventMap = Record<EventName, any[]>>
-	implements IEventEmitter<Events>
-{
-	/** Storage for event handlers mapped by event name */
-	private eventHandlers: Record<
-		keyof Events,
-		WildcardHandler<any> | WildcardHandler<any>[] | undefined
-	> = {} as Record<
-		keyof Events,
-		WildcardHandler<any> | WildcardHandler<any>[] | undefined
-	>;
+export type EventMap = Record<string | symbol, readonly unknown[]>;
 
-	/** Storage for internal event handlers (newListener, removeListener) */
-	private internalHandlers: Partial<
-		Record<keyof InternalEvents, EventHandler<any>[]>
-	> = {};
+/**
+ * Extract event names from an EventMap.
+ */
+export type EventNames<T extends EventMap> = keyof T & (string | symbol);
 
-	/** Handlers that receive all events regardless of name */
-	private globalHandlers: Array<(...args: any[]) => void> = [];
+/**
+ * Extract listener function type for a specific event.
+ */
+export type EventListener<
+	T extends EventMap,
+	K extends EventNames<T>,
+> = T[K] extends readonly unknown[] ? (...args: T[K]) => void : never;
 
-	/** Handlers that receive all internal events */
-	private globalInternalHandlers: Array<
-		(event: EventName, ...args: any[]) => void
-	> = [];
+/**
+ * Options for removing listeners.
+ */
+export type RemoveListenerOptions = {
+	/** Only remove listeners with this context */
+	readonly context?: unknown;
+	/** Only remove one-time listeners */
+	readonly once?: boolean;
+};
 
-	/** Maximum number of handlers per event before warning */
-	private maxHandlersCount = 10;
+/**
+ * Internal listener wrapper structure.
+ * Uses a plain object for minimal memory overhead.
+ *
+ * The `context` field stores the `this` value that will be bound to the listener
+ * function when it's invoked (via `fn.call(context, ...args)`). This is a performance
+ * optimization over using `.bind()`:
+ *
+ * ```typescript
+ * // Without context support, users must allocate a bound function:
+ * emitter.on('event', this.handleEvent.bind(this));
+ *
+ * // With context support, no allocation is needed:
+ * emitter.on('event', this.handleEvent, this);
+ * ```
+ *
+ * The context is also used for listener matching in `off()` - if a context was
+ * provided when adding a listener, the same context can be used to identify
+ * and remove that specific listener.
+ */
+type Listener = {
+	readonly fn: (...args: readonly unknown[]) => void;
+	/** The `this` value to bind when invoking `fn`. See type docs for details. */
+	readonly context: unknown;
+	readonly once: boolean;
+};
 
-	/** Tree structure for storing wildcard event handlers */
-	private wildcardTree: Record<string | symbol, any> = {};
+/**
+ * Internal structure for storing listeners per event.
+ * Single listener is stored directly, multiple as array.
+ */
+type ListenerStore = Listener | Listener[];
 
-	/** Whether wildcard event patterns are supported */
-	private supportsWildcards: boolean;
+/**
+ * Create a null-prototype object for storing events.
+ * Avoids prototype chain lookups and hasOwnProperty checks.
+ */
+function createEventsObject(): Record<string | symbol, ListenerStore> {
+	return Object.create(null) as Record<string | symbol, ListenerStore>;
+}
 
-	/** Character used to separate event namespace parts */
-	private delimiter: string;
+/**
+ * Check if a listener store contains a single listener (has 'fn' property).
+ */
+function isSingleListener(store: ListenerStore): store is Listener {
+	return "fn" in store;
+}
 
-	/** Whether to emit events when new listeners are added */
-	private notifyNewListener: boolean;
+/**
+ * Safely get an element from an array with bounds checking.
+ */
+function getAt<T>(array: T[], index: number): T | undefined {
+	return index >= 0 && index < array.length ? array[index] : undefined;
+}
 
-	/** Whether to emit events when listeners are removed */
-	private notifyRemoveListener: boolean;
-
-	/** Whether to show detailed warnings for potential memory leaks */
-	private detailedLeakWarnings: boolean;
-
-	/** Whether to suppress error events when no handlers exist */
-	private suppressErrors: boolean;
+/**
+ * High-performance, strictly-typed EventEmitter.
+ *
+ * This implementation combines eventemitter3's micro-optimizations with
+ * TypeScript's type system for end-to-end type safety.
+ *
+ * Performance optimizations:
+ * 1. Null-prototype events object (no hasOwnProperty needed)
+ * 2. Single listener optimization (no array for single listener)
+ * 3. Direct call optimization for 0-5 arguments (avoids .apply())
+ * 4. Built-in context support (no .bind() allocation)
+ * 5. Event count tracking (fast eventNames())
+ *
+ * @typeParam T - Event map defining event names and their argument tuples
+ */
+export class TypedEventEmitter<T extends EventMap> {
+	/**
+	 * Default maximum number of deferred events before throwing an error.
+	 */
+	static readonly DEFAULT_MAX_DEFERRED = 10000;
 
 	/**
-	 * Creates a new EventEmitter instance
-	 * @param settings Configuration options for the emitter
+	 * Internal events storage. Uses null-prototype object.
+	 * @internal
 	 */
-	constructor(settings: EmitterSettings = {}) {
-		this.supportsWildcards = settings.useWildcards ?? false;
-		this.delimiter = settings.namespaceDelimiter ?? ".";
-		this.notifyNewListener = settings.emitNewListener ?? false;
-		this.notifyRemoveListener = settings.emitRemoveListener ?? false;
-		this.maxHandlersCount = settings.maxHandlers ?? 10;
-		this.detailedLeakWarnings = settings.detailedLeakWarnings ?? false;
-		this.suppressErrors = settings.suppressErrors ?? false;
+	#events: Record<string | symbol, ListenerStore> = createEventsObject();
 
-		if (this.supportsWildcards) {
-			this.wildcardTree = {};
-		}
+	/**
+	 * Count of events with listeners. Enables fast eventNames() checks.
+	 * @internal
+	 */
+	#eventCount = 0;
+
+	/**
+	 * Queue for deferred events.
+	 * @internal
+	 */
+	#deferredQueue: Array<() => void> = [];
+
+	/**
+	 * Maximum number of allowed deferred events.
+	 * @internal
+	 */
+	readonly #maxDeferredEvents: number;
+
+	/**
+	 * Create a new TypedEventEmitter.
+	 *
+	 * @param options - Configuration options
+	 */
+	constructor(options?: { maxDeferredEvents?: number }) {
+		this.#maxDeferredEvents =
+			options?.maxDeferredEvents ?? TypedEventEmitter.DEFAULT_MAX_DEFERRED;
 	}
 
 	/**
-	 * Prepares an event handler with optional async behavior
-	 * @param event Event name or array of event names
-	 * @param handler The event handler function
-	 * @param options Options for handler execution
+	 * Add a listener for an event.
+	 *
+	 * @param event - The event name
+	 * @param fn - The listener function
+	 * @param context - Optional context (`this` value) for the listener
+	 * @returns this (for chaining)
 	 */
-	private prepareHandler<E extends keyof Events>(
-		handler: EventHandler<Events[E]>,
-		options: HandlerOptions = {},
-	): EventHandler<Events[E]> {
-		const {
-			runAsync = false,
-			useNextTick = false,
-			promisify = handler.constructor.name === "AsyncFunction",
-		} = options;
-
-		if (!runAsync && !useNextTick && !promisify) return handler;
-
-		const originalHandler = handler;
-		return ((...args: Events[E]) => {
-			const context = this;
-			if (promisify) {
-				const delayFn =
-					useNextTick && typeof process?.nextTick === "function"
-						? Promise.resolve().then
-						: (fn: () => void) =>
-								new Promise((resolve) => setImmediate(resolve)).then(fn);
-				return delayFn(() => originalHandler.apply(context, args));
-			}
-			const scheduler =
-				useNextTick && typeof process?.nextTick === "function"
-					? process.nextTick
-					: setImmediate;
-			scheduler(() => originalHandler.apply(context, args));
-		}) as EventHandler<Events[E]>;
-	}
-
-	/**
-	 * Emits an internal event (newListener, removeListener)
-	 * @param event Internal event name
-	 * @param args Arguments to pass to the handlers
-	 */
-	private emitInternal<K extends keyof InternalEvents>(
+	on<K extends EventNames<T>>(
 		event: K,
-		...args: InternalEvents[K]
-	): void {
-		const handlers = this.internalHandlers[event];
-		if (handlers) {
-			handlers.forEach((handler) => handler(...args));
-		}
-	}
-
-	/**
-	 * Registers an event handler for the specified event(s)
-	 * @param event Event name or array of event names
-	 * @param handler The event handler function
-	 * @param options Options for handler execution
-	 * @returns The EventEmitter instance or handler reference object
-	 */
-	on<E extends keyof Events>(
-		event: E | E[],
-		handler: EventHandler<Events[E]>,
-		options: HandlerOptions = {},
-	): EventEmitter<Events> | HandlerReference<Events, E> {
-		const { returnObject = false } = options;
-		const preparedHandler = this.prepareHandler(handler, options);
-
-		// Handle internal events
-		if (
-			typeof event === "string" &&
-			(event === "newListener" || event === "removeListener")
-		) {
-			const internalEvent = event as keyof InternalEvents;
-			if (!this.internalHandlers[internalEvent]) {
-				this.internalHandlers[internalEvent] = [];
-			}
-			this.internalHandlers[internalEvent]!.push(handler);
-			return this as EventEmitter<Events>;
-		}
-
-		if (this.notifyNewListener) {
-			this.emitInternal("newListener", event as unknown as EventNames, handler);
-		}
-
-		if (this.supportsWildcards) {
-			this.addToWildcardTree(event as unknown as EventNames, preparedHandler);
-		} else {
-			const eventKey = event as E;
-			const currentHandlers = this.eventHandlers[eventKey];
-			if (!currentHandlers) {
-				this.eventHandlers[eventKey] = preparedHandler as WildcardHandler<
-					Events[E]
-				>;
-			} else if (Array.isArray(currentHandlers)) {
-				currentHandlers.push(preparedHandler as WildcardHandler<Events[E]>);
-				this.checkHandlerLimit(String(eventKey), currentHandlers.length);
-			} else {
-				this.eventHandlers[eventKey] = [
-					currentHandlers,
-					preparedHandler as WildcardHandler<Events[E]>,
-				];
-				this.checkHandlerLimit(String(eventKey), 2);
-			}
-		}
-
-		return returnObject
-			? {
-					emitter: this as EventEmitter<Events>,
-					event,
-					handler,
-					remove: () => this.off(event, handler),
-				}
-			: (this as EventEmitter<Events>);
-	}
-
-	/**
-	 * Registers a one-time event handler that will be removed after execution
-	 * @param event Event name or array of event names
-	 * @param handler The event handler function
-	 * @param options Options for handler execution
-	 */
-	once<E extends keyof Events>(
-		event: E | E[],
-		handler: EventHandler<Events[E]>,
-		options: HandlerOptions = {},
-	): EventEmitter<Events> {
-		return this.limitedTimes(event, 1, handler, options);
-	}
-
-	/**
-	 * Registers an event handler that will be removed after specified number of executions
-	 * @param event Event name or array of event names
-	 * @param times Number of times the handler should execute before being removed
-	 * @param handler The event handler function
-	 * @param options Options for handler execution
-	 */
-	limitedTimes<E extends keyof Events>(
-		event: E | E[],
-		times: number,
-		handler: EventHandler<Events[E]>,
-		options: HandlerOptions = {},
-	): EventEmitter<Events> {
-		if (typeof handler !== "function") {
-			throw new Error("Handler must be a function");
-		}
-
-		let remainingCalls = times;
-		const wrappedHandler = ((...args: Events[E]) => {
-			if (--remainingCalls === 0) {
-				this.off(event, wrappedHandler);
-			}
-			return handler(...args);
-		}) as EventHandler<Events[E]>;
-
-		return this.on(event, wrappedHandler, options) as EventEmitter<Events>;
-	}
-
-	/**
-	 * Synchronously emits an event with the specified arguments
-	 * @param event Event name
-	 * @param args Arguments to pass to the handlers
-	 * @returns true if the event had listeners, false otherwise
-	 */
-	emit<E extends keyof Events>(event: E, ...args: Events[E]): boolean {
-		if (!this.eventHandlers && !this.globalHandlers) return false;
-
-		const handlers = this.supportsWildcards
-			? this.findWildcardHandlers(String(event) as EventName)
-			: this.eventHandlers[event];
-
-		if (this.globalInternalHandlers.length) {
-			this.globalInternalHandlers.forEach((handler) =>
-				handler(String(event) as EventName, ...args),
-			);
-		}
-
-		if (this.globalHandlers.length) {
-			this.globalHandlers.forEach((handler) => handler(...args));
-		}
-
-		if (!handlers) {
-			if (event === "error" && !this.suppressErrors) {
-				throw args[0] instanceof Error
-					? args[0]
-					: new Error("Uncaught, unspecified 'error' event.");
-			}
-			return false;
-		}
-
-		if (typeof handlers === "function") {
-			(handlers as EventHandler<Events[E]>)(...args);
-			return true;
-		}
-
-		(handlers as Array<EventHandler<Events[E]>>).forEach((handler) =>
-			handler(...args),
+		fn: EventListener<T, K>,
+		context?: unknown,
+	): this {
+		return this.#addListener(
+			event,
+			fn as unknown as Listener["fn"],
+			context,
+			false,
 		);
-		return true;
 	}
 
 	/**
-	 * Asynchronously emits an event with the specified arguments
-	 * @param event Event name
-	 * @param args Arguments to pass to the handlers
-	 * @returns Promise that resolves with array of handler results
+	 * Add a one-time listener for an event. It will be automatically
+	 * removed after being invoked once.
+	 *
+	 * @param event - The event name
+	 * @param fn - The listener function
+	 * @param context - Optional context (`this` value) for the listener
+	 * @returns this (for chaining)
 	 */
-	async emitAsync<E extends keyof Events>(
-		event: E,
-		...args: Events[E]
-	): Promise<any[]> {
-		const handlers = this.supportsWildcards
-			? this.findWildcardHandlers(String(event) as EventName)
-			: this.eventHandlers[event];
-
-		const globalPromises = this.globalInternalHandlers.map((handler) =>
-			handler(String(event) as EventName, ...args),
+	once<K extends EventNames<T>>(
+		event: K,
+		fn: EventListener<T, K>,
+		context?: unknown,
+	): this {
+		return this.#addListener(
+			event,
+			fn as unknown as Listener["fn"],
+			context,
+			true,
 		);
-
-		if (!handlers) {
-			if (event === "error" && !this.suppressErrors) {
-				return Promise.reject(
-					args[0] instanceof Error
-						? args[0]
-						: new Error("Uncaught, unspecified 'error' event."),
-				);
-			}
-			return Promise.all(globalPromises);
-		}
-
-		const handlerPromises = (
-			Array.isArray(handlers) ? handlers : [handlers]
-		).map((handler) => (handler as EventHandler<Events[E]>)(...args));
-
-		return Promise.all([...globalPromises, ...handlerPromises]);
 	}
 
 	/**
-	 * Removes an event handler for the specified event
-	 * @param event Event name or array of event names
-	 * @param handler The handler function to remove
+	 * Internal method to add a listener.
+	 * Implements single-listener optimization.
 	 */
-	off<E extends keyof Events>(
-		event: E | E[],
-		handler: EventHandler<Events[E]>,
-	): EventEmitter<Events> {
-		if (this.supportsWildcards) {
-			const eventParts = this.parseEventName(event as unknown as EventNames);
-			const matches = this.findWildcardHandlers(eventParts);
-			if (matches) {
-				matches.forEach((match) => {
-					const handlers = (match as WildcardHandler<Events[E]>)._listeners;
-					if (Array.isArray(handlers)) {
-						const index = handlers.findIndex(
-							(h) =>
-								h === handler ||
-								(h as WildcardHandler<Events[E]>).listener === handler,
-						);
-						if (index >= 0) {
-							handlers.splice(index, 1);
-							if (this.notifyRemoveListener)
-								this.emitInternal(
-									"removeListener",
-									event as unknown as EventNames,
-									handler,
-								);
-						}
-					}
-				});
-			}
+	#addListener<K extends EventNames<T>>(
+		event: K,
+		fn: Listener["fn"],
+		context: unknown,
+		once: boolean,
+	): this {
+		const listener: Listener = { fn, context, once };
+		const existing = this.#events[event];
+
+		if (!existing) {
+			// First listener: store directly (no array)
+			this.#events[event] = listener;
+			this.#eventCount++;
+		} else if (isSingleListener(existing)) {
+			// Second listener: convert to array
+			this.#events[event] = [existing, listener];
 		} else {
-			const eventKey = event as E;
-			const handlers = this.eventHandlers[eventKey];
-			if (Array.isArray(handlers)) {
-				const index = handlers.findIndex(
-					(h) => h === handler || h.listener === handler,
-				);
-				if (index >= 0) {
-					handlers.splice(index, 1);
-					if (handlers.length === 0) delete this.eventHandlers[eventKey];
-					if (this.notifyRemoveListener)
-						this.emitInternal(
-							"removeListener",
-							event as unknown as EventNames,
-							handler,
-						);
-				}
-			} else if (handlers === handler || handlers?.listener === handler) {
-				delete this.eventHandlers[eventKey];
-				if (this.notifyRemoveListener)
-					this.emitInternal(
-						"removeListener",
-						event as unknown as EventNames,
-						handler,
-					);
-			}
+			// Additional listeners: push to array
+			existing.push(listener);
 		}
-		return this as EventEmitter<Events>;
-	}
 
-	/**
-	 * Finds all handlers that match a wildcard event pattern
-	 * @param event Event name or pattern
-	 * @returns Array of matching handlers
-	 */
-	private findWildcardHandlers(
-		event: EventName | EventName[],
-	): EventHandler<any>[] {
-		const eventParts = this.parseEventName(event);
-		const foundHandlers: EventHandler<any>[] = [];
-
-		// Helper function to traverse the tree
-		const traverse = (
-			parts: (string | symbol)[],
-			tree: Record<string | symbol, any>,
-			isDeepWildcard = false,
-		) => {
-			// If we reach the end of the path, add any listeners at this level
-			if (parts.length === 0) {
-				if (tree._listeners) {
-					foundHandlers.push(
-						...(Array.isArray(tree._listeners)
-							? tree._listeners
-							: [tree._listeners]),
-					);
-				}
-				return;
-			}
-
-			const [current, ...rest] = parts;
-
-			// Check for exact match
-			if (tree[current]) {
-				traverse(rest, tree[current], false);
-			}
-
-			// Check for wildcard matches
-			if (tree["*"]) {
-				traverse(rest, tree["*"], false);
-			}
-
-			// Check for deep wildcard matches
-			if (tree["**"]) {
-				// Add current level handlers
-				if (tree["**"]._listeners) {
-					foundHandlers.push(
-						...(Array.isArray(tree["**"]._listeners)
-							? tree["**"]._listeners
-							: [tree["**"]._listeners]),
-					);
-				}
-				// Continue checking deeper levels with the same pattern
-				traverse(rest, tree["**"], true);
-				if (!isDeepWildcard) {
-					// Also try matching the rest of the pattern at this level
-					traverse(parts, tree["**"], true);
-				}
-			}
-		};
-
-		traverse(eventParts, this.wildcardTree);
-		return [...new Set(foundHandlers)]; // Deduplicate handlers
-	}
-
-	/**
-	 * Adds a handler to the wildcard event tree
-	 * @param event Event name or pattern
-	 * @param handler The handler function
-	 */
-	private addToWildcardTree(
-		event: EventNames,
-		handler: EventHandler<any>,
-	): void {
-		const eventParts = this.parseEventName(event);
-		let currentLevel = this.wildcardTree;
-
-		// For wildcard patterns, we need to handle them differently
-		if (eventParts.includes("*") || eventParts.includes("**")) {
-			// Create the pattern structure
-			for (const [index, part] of eventParts.entries()) {
-				if (part === "**") {
-					// For deep wildcards, add the handler at this level and continue
-					if (!currentLevel._listeners) {
-						currentLevel._listeners = handler;
-					} else if (Array.isArray(currentLevel._listeners)) {
-						currentLevel._listeners.push(handler);
-					} else {
-						currentLevel._listeners = [currentLevel._listeners, handler];
-					}
-				}
-				currentLevel = currentLevel[part] = currentLevel[part] || {};
-
-				if (index === eventParts.length - 1) {
-					if (!currentLevel._listeners) {
-						currentLevel._listeners = handler;
-					} else if (Array.isArray(currentLevel._listeners)) {
-						currentLevel._listeners.push(handler);
-					} else {
-						currentLevel._listeners = [currentLevel._listeners, handler];
-					}
-				}
-			}
-		} else {
-			// Regular event path
-			for (const [index, part] of eventParts.entries()) {
-				currentLevel = currentLevel[part] = currentLevel[part] || {};
-				if (index === eventParts.length - 1) {
-					if (!currentLevel._listeners) {
-						currentLevel._listeners = handler;
-					} else if (Array.isArray(currentLevel._listeners)) {
-						currentLevel._listeners.push(handler);
-					} else {
-						currentLevel._listeners = [currentLevel._listeners, handler];
-					}
-				}
-			}
-		}
-	}
-
-	/**
-	 * Recursively collects all handlers from a branch of the wildcard tree
-	 * @param level Current tree level
-	 * @param handlers Array to collect handlers into
-	 */
-	private collectAllHandlers(level: any, handlers: EventHandler<any>[]): void {
-		for (const [key, branch] of Object.entries(level)) {
-			if (key !== "_listeners" && typeof branch === "object") {
-				this.collectAllHandlers(branch, handlers);
-			} else if (key === "_listeners" && branch) {
-				handlers.push(...(Array.isArray(branch) ? branch : [branch]));
-			}
-		}
-	}
-
-	/**
-	 * Parses an event name into its namespace parts
-	 * @param event Event name or array of names
-	 * @returns Array of namespace parts
-	 */
-	private parseEventName(
-		event: EventNames | keyof Events,
-	): (string | symbol)[] {
-		if (typeof event === "string") {
-			return event.split(this.delimiter);
-		}
-		if (Array.isArray(event)) {
-			return event.map((e) => String(e) as EventName);
-		}
-		return [String(event) as EventName];
-	}
-
-	/**
-	 * Checks if number of handlers exceeds limit and warns if necessary
-	 * @param event Event name
-	 * @param count Number of handlers
-	 */
-	private checkHandlerLimit(event: string | symbol, count: number): void {
-		if (this.maxHandlersCount > 0 && count > this.maxHandlersCount) {
-			const warning = `Warning: Possible EventEmitter memory leak detected. ${count} handlers added for ${String(event)}.`;
-			console.warn(
-				this.detailedLeakWarnings
-					? `${warning} Use setMaxHandlers() to increase limit.`
-					: warning,
-			);
-		}
-	}
-
-	/**
-	 * Sets the maximum number of handlers per event before warning
-	 * @param count Maximum number of handlers
-	 */
-	setMaxHandlers(count: number): this {
-		this.maxHandlersCount = count;
 		return this;
 	}
 
 	/**
-	 * Gets the current maximum number of handlers per event
-	 * @returns Maximum number of handlers
+	 * Remove a listener for an event.
+	 *
+	 * @param event - The event name
+	 * @param fn - The listener function to remove. If omitted, removes all listeners for the event.
+	 * @param options - Additional options for matching listeners
+	 * @returns this (for chaining)
 	 */
-	getMaxHandlers(): number {
-		return this.maxHandlersCount;
+	off<K extends EventNames<T>>(
+		event: K,
+		fn?: EventListener<T, K>,
+		options?: RemoveListenerOptions,
+	): this {
+		const store = this.#events[event];
+		if (!store) return this;
+
+		// If no function specified, remove all listeners for this event
+		if (!fn) {
+			delete this.#events[event];
+			this.#eventCount--;
+			return this;
+		}
+
+		const context = options?.context;
+		const once = options?.once;
+		const targetFn = fn as unknown as Listener["fn"];
+
+		if (isSingleListener(store)) {
+			// Single listener case
+			if (
+				store.fn === targetFn &&
+				(once === undefined || store.once === once) &&
+				(context === undefined || store.context === context)
+			) {
+				delete this.#events[event];
+				this.#eventCount--;
+			}
+		} else {
+			// Array case: remove only the FIRST matching listener (Node.js semantics)
+			// This is more intuitive: add twice = remove twice
+			let removed = false;
+			const remaining: Listener[] = [];
+
+			for (let i = 0; i < store.length; i++) {
+				const listener = getAt(store, i);
+				if (listener) {
+					const isMatch =
+						!removed &&
+						listener.fn === targetFn &&
+						(once === undefined || listener.once === once) &&
+						(context === undefined || listener.context === context);
+
+					if (isMatch) {
+						removed = true;
+						// Don't add to remaining - this is the one we're removing
+					} else {
+						remaining.push(listener);
+					}
+				}
+			}
+
+			if (!removed) {
+				// No match found, nothing to do
+				return this;
+			}
+
+			if (remaining.length === 0) {
+				delete this.#events[event];
+				this.#eventCount--;
+			} else if (remaining.length === 1) {
+				// Convert back to single listener
+				// Safe: length === 1 guarantees remaining[0] exists
+				const single = remaining[0];
+				if (single) this.#events[event] = single;
+			} else {
+				this.#events[event] = remaining;
+			}
+		}
+
+		return this;
+	}
+
+	/**
+	 * Emit an event with the given arguments.
+	 *
+	 * @param event - The event name
+	 * @param args - The event arguments (must match the EventMap definition)
+	 * @returns `true` if the event had listeners, `false` otherwise
+	 */
+	emit<K extends EventNames<T>>(event: K, ...args: T[K]): boolean {
+		const store = this.#events[event];
+		if (!store) return false;
+
+		if (isSingleListener(store)) {
+			// Single listener path
+			// Invoke first, then remove if once (matches Node.js semantics)
+			// Use try/finally to ensure cleanup even if listener throws
+			try {
+				this.#invoke(store, args);
+			} finally {
+				// Only remove if store wasn't modified during invoke
+				if (store.once && this.#events[event] === store) {
+					delete this.#events[event];
+					this.#eventCount--;
+				}
+			}
+		} else {
+			// Multiple listeners path
+			// Snapshot the listeners to iterate safely - prevents issues when
+			// a listener removes another listener during emission (correctness > performance)
+			// Note: At this point, store is guaranteed to be Listener[] (not single Listener)
+			const listenersToInvoke = store.slice();
+			let hasOnceListeners = false;
+
+			try {
+				// Invoke all snapshotted listeners (Node.js semantics)
+				// Listeners removed during emit are still called if they were
+				// present at snapshot time - this matches Node.js EventEmitter
+				for (const listener of listenersToInvoke) {
+					if (listener.once) hasOnceListeners = true;
+					this.#invoke(listener, args);
+				}
+			} finally {
+				// After invoking, clean up 'once' listeners from current state
+				// Handle both array and single-listener states (mutations may have reduced it)
+				// Use finally to ensure cleanup even if listener throws
+				if (hasOnceListeners) {
+					const currentStore = this.#events[event];
+					if (!currentStore) {
+						// All listeners were removed during emit, nothing to do
+					} else if (isSingleListener(currentStore)) {
+						// Store was reduced to single listener - check if it's once
+						if (currentStore.once) {
+							delete this.#events[event];
+							this.#eventCount--;
+						}
+					} else {
+						// Still an array - filter out once listeners
+						const remaining = currentStore.filter((l) => !l.once);
+
+						if (remaining.length === 0) {
+							delete this.#events[event];
+							this.#eventCount--;
+						} else if (remaining.length === 1) {
+							// Safe: length === 1 guarantees remaining[0] exists
+							const single = remaining[0];
+							if (single) this.#events[event] = single;
+						} else {
+							this.#events[event] = remaining;
+						}
+					}
+				}
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * Emit an event asynchronously using `queueMicrotask`.
+	 * This ensures the event is processed as soon as the current call stack clears,
+	 * but before the next event loop iteration (macrotask).
+	 *
+	 * This is a "fire-and-forget" operation.
+	 *
+	 * @param event - The event name
+	 * @param args - The event arguments
+	 */
+	emitAsync<K extends EventNames<T>>(event: K, ...args: T[K]): void {
+		queueMicrotask(() => {
+			this.emit(event, ...args);
+		});
+	}
+
+	/**
+	 * Queue an event to be emitted later when `flushDeferred()` is called.
+	 * This allows buffering events to be processed in batches (e.g., at the end of a frame).
+	 *
+	 * @param event - The event name
+	 * @param args - The event arguments
+	 * @throws Error if the deferred queue size exceeds `maxDeferredEvents`
+	 */
+	emitDeferred<K extends EventNames<T>>(event: K, ...args: T[K]): void {
+		if (this.#deferredQueue.length >= this.#maxDeferredEvents) {
+			throw new Error(
+				`[EventEmitter] Deferred queue overflow (max: ${this.#maxDeferredEvents})`,
+			);
+		}
+		this.#deferredQueue.push(() => this.emit(event, ...args));
+	}
+
+	/**
+	 * Synchronously flush all queued deferred events.
+	 *
+	 * - Events are processed in the order they were queued.
+	 * - The queue is cleared *before* processing to safely handle re-entrancy
+	 *   (events queued during flush will be processed in the next flush).
+	 * - Errors in individual events are logged but do not stop the flush process.
+	 */
+	flushDeferred(): void {
+		const queue = this.#deferredQueue;
+		if (queue.length === 0) return;
+
+		// Clear queue immediately to handle re-entrancy safe
+		this.#deferredQueue = [];
+
+		for (const task of queue) {
+			try {
+				task();
+			} catch (error) {
+				// Error isolation: log and continue
+				console.error("[EventEmitter] Error in deferred dispatch:", error);
+			}
+		}
+	}
+
+	/**
+	 * Invoke a listener with arguments.
+	 * Uses direct call for 0-5 arguments to avoid Function.prototype.apply overhead.
+	 */
+	#invoke(listener: Listener, args: readonly unknown[]): void {
+		const fn = listener.fn;
+		const ctx = listener.context;
+		const len = args.length;
+
+		// Direct call optimization for common cases (0-5 arguments)
+		// This avoids the overhead of Function.prototype.apply
+		switch (len) {
+			case 0:
+				fn.call(ctx);
+				return;
+			case 1:
+				fn.call(ctx, args[0]);
+				return;
+			case 2:
+				fn.call(ctx, args[0], args[1]);
+				return;
+			case 3:
+				fn.call(ctx, args[0], args[1], args[2]);
+				return;
+			case 4:
+				fn.call(ctx, args[0], args[1], args[2], args[3]);
+				return;
+			case 5:
+				fn.call(ctx, args[0], args[1], args[2], args[3], args[4]);
+				return;
+			default:
+				// Fallback for 6+ arguments
+				fn.apply(ctx, args as unknown[]);
+		}
+	}
+
+	/**
+	 * Get the number of listeners for an event.
+	 *
+	 * @param event - The event name
+	 * @returns The number of listeners
+	 */
+	listenerCount<K extends EventNames<T>>(event: K): number {
+		const store = this.#events[event];
+		if (!store) return 0;
+		if (isSingleListener(store)) return 1;
+		return store.length;
+	}
+
+	/**
+	 * Get all listeners for an event.
+	 *
+	 * @param event - The event name
+	 * @returns Array of listener functions
+	 */
+	listeners<K extends EventNames<T>>(event: K): Array<EventListener<T, K>> {
+		const store = this.#events[event];
+		if (!store) return [];
+		if (isSingleListener(store)) {
+			return [store.fn as unknown as EventListener<T, K>];
+		}
+		return store.map((l) => l.fn as unknown as EventListener<T, K>);
+	}
+
+	/**
+	 * Get all event names that have listeners.
+	 *
+	 * @returns Array of event names
+	 */
+	eventNames(): Array<EventNames<T>> {
+		if (this.#eventCount === 0) return [];
+
+		// Use Reflect.ownKeys to get both string and symbol keys
+		return Reflect.ownKeys(this.#events) as Array<EventNames<T>>;
+	}
+
+	/**
+	 * Remove all listeners for an event, or all listeners if no event specified.
+	 *
+	 * @param event - Optional event name. If omitted, removes all listeners.
+	 * @returns this (for chaining)
+	 */
+	removeAllListeners<K extends EventNames<T>>(event?: K): this {
+		if (event !== undefined) {
+			if (this.#events[event]) {
+				delete this.#events[event];
+				this.#eventCount--;
+			}
+		} else {
+			this.#events = createEventsObject();
+			this.#eventCount = 0;
+		}
+		return this;
+	}
+
+	/**
+	 * Alias for `on`.
+	 *
+	 * @param event - The event name
+	 * @param fn - The listener function
+	 * @param context - Optional context (`this` value) for the listener
+	 * @returns this (for chaining)
+	 */
+	addListener<K extends EventNames<T>>(
+		event: K,
+		fn: EventListener<T, K>,
+		context?: unknown,
+	): this {
+		return this.on(event, fn, context);
+	}
+
+	/**
+	 * Alias for `off`.
+	 *
+	 * @param event - The event name
+	 * @param fn - The listener function to remove
+	 * @param options - Additional options for matching listeners
+	 * @returns this (for chaining)
+	 */
+	removeListener<K extends EventNames<T>>(
+		event: K,
+		fn?: EventListener<T, K>,
+		options?: RemoveListenerOptions,
+	): this {
+		return this.off(event, fn, options);
 	}
 }
+
+/**
+ * Utility type to define events with a schema-like syntax.
+ * This extracts parameter types from function signatures.
+ *
+ * @example
+ * ```typescript
+ * const events = defineEvents({
+ *   'pointer:down': (x: number, y: number) => {},
+ *   'viewport:resize': (width: number, height: number, dpr: number) => {},
+ *   'selection:change': (ids: Set<string>) => {},
+ * });
+ *
+ * // Infers: {
+ * //   'pointer:down': [x: number, y: number];
+ * //   'viewport:resize': [width: number, height: number, dpr: number];
+ * //   'selection:change': [ids: Set<string>];
+ * // }
+ * type MyEvents = typeof events;
+ * ```
+ */
+export type DefineEvents<T extends Record<string, (...args: never[]) => void>> =
+	{
+		[K in keyof T]: Parameters<T[K]>;
+	};
+
+/**
+ * Helper function to define events with type inference.
+ * The actual runtime value is irrelevant; this is purely for type inference.
+ *
+ * @param _schema - Object with event handlers (only used for type inference)
+ * @returns Type-only representation of the event map
+ */
+export function defineEvents<
+	T extends Record<string, (...args: never[]) => void>,
+>(_schema: T): DefineEvents<T> {
+	// This function is purely for type inference
+	// The return value is never used at runtime
+	return undefined as unknown as DefineEvents<T>;
+}
+
+// Default export for convenience
+export default TypedEventEmitter;
