@@ -1,0 +1,18 @@
+{
+	"$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+	"root": true,
+	"files": {
+		"ignoreUnknown": true,
+		"includes": [
+			// Include all files in the workspace
+			"**/*",
+			// Exclude generated files from being formatted/linted
+			"!**/__generated__.*"
+		]
+	},
+	"vcs": {
+		"enabled": true,
+		"clientKind": "git",
+		"useIgnoreFile": true
+	}
+}
