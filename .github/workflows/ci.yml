@@ -22,7 +22,7 @@ jobs:
 
       # Checkout code - https://github.com/actions/checkout
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       # Install bun using the official action - https://github.com/oven-sh/setup-bun
       - name: Setup bun
@@ -31,7 +31,7 @@ jobs:
       # Install dependencies. Omitting cache per -
       # https://github.com/oven-sh/setup-bun/issues/14#issuecomment-1714116221
       - name: Install dependencies - bun
-        run: bun install --silent --frozen-lockfile && cd tests && bun install --silent --frozen-lockfile
+        run: bun install --silent --frozen-lockfile
 
       #
       # Lint -----------------------------------------------------------------
