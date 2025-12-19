@@ -11,16 +11,6 @@ A high-performance, fully type-safe EventEmitter implementation for TypeScript w
 - 🌐 **Cross-Platform**: Works in Browser, Node.js, and Bun with zero dependencies.
 - 📦 **Tiny**: Minimal footprint, no external dependencies.
 
-## Installation
-
-```bash
-# Using bun
-bun add safe-event-emitter-ts
-
-# Using npm
-npm install safe-event-emitter-ts
-```
-
 ## Basic Usage
 
 ```typescript

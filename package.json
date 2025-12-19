@@ -1,5 +1,5 @@
 {
-	"name": "safe-event-emitter-ts",
+	"name": "typed-event-emitter",
 	"version": "0.1.2",
 	"license": "MIT",
 	"type": "module",
